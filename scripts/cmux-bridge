@@ -1,0 +1,885 @@
+#!/usr/bin/env bash
+# cmux-bridge - wrapper for cross-agent conversation across cmux panes.
+#
+# Designed as the smallest useful Bash wrapper for moving text between AI agents
+# such as Claude Code, Codex CLI, and Gemini CLI through cmux terminal panes.
+# Subcommands: id / list / read / send / submit / message / clear / key.
+# `clear` is a slash-command helper that sends raw `/clear` without the bridge
+# message header.
+
+set -euo pipefail
+
+# `message` needs self both for self-loop checks and reply-to construction.
+# Why: cache the resolved self only inside this process to avoid duplicate
+# `cmux identify` calls. The script runs one subcommand per process, so this
+# global state cannot leak across invocations.
+CHECKED_SELF_SURFACE=""
+
+usage() {
+    cat <<'EOF'
+Usage: cmux-bridge <subcommand> [args...]
+
+Subcommands:
+  id                                Print this pane's surface_ref
+  list [--workspace <workspace>]    List surfaces
+  read [--workspace <workspace>] <surface> [lines]
+                                    Read a target surface screen; with lines, read the last N lines
+  send [--workspace <workspace>] [--force] <surface> <text>
+                                    Send text to a target surface without Enter
+  submit [--workspace <workspace>] [--force] <surface> <text>
+                                    Send text, then send Enter
+  message [--dry-run] [--force] [--workspace <workspace>] <target> <body>
+                                    Send with bridge message metadata
+  clear [--workspace <workspace>] [--force] <surface>
+                                    Send raw /clear without the bridge message header
+  key [--workspace <workspace>] [--force] <surface> <key>
+                                    Send a key event, e.g. enter or ctrl+c
+
+Flags:
+  --force                           Skip surface_type precheck and allow non-terminal targets
+                                    Self-loop rejection (exit 9) and target syntax checks
+                                    (exit 6) always still apply
+  --dry-run                         message only: print the payload without sending
+  --workspace <workspace>            Workspace context for resolving the target surface,
+                                    e.g. workspace:11
+
+Environment variables:
+  CMUX_AGENT_NAME                   Explicit sender name for the message subcommand
+  CLAUDECODE                        If set to "1", auto-detect sender as "claude-code"
+  CODEX_THREAD_ID                   If non-empty, auto-detect sender as "codex"
+                                    Final fallback is $(whoami)
+
+Exit codes:
+  0  Success
+  1  Runtime error, such as cmux not running, missing args, or unknown subcommand
+  2  Argument error, such as extra args or unknown flags
+  3  Schema violation in cmux JSON output
+  4  Bridge message format violation in body or sender
+  5  Invalid reply-to/self surface format
+  6  Invalid target characters or missing surface
+  7  Target surface_type is not terminal
+  8  Running outside cmux context; caller is null
+  9  Target equals self surface; self-loop rejected, even with --force
+
+Examples:
+  cmux-bridge id
+  cmux-bridge list
+EOF
+}
+
+has_self_env_request() {
+    # Why: `${VAR:-}` cannot distinguish unset from explicitly empty.
+    # An empty value is also a self-env configuration error, so use +x.
+    [[ -n "${CMUX_BRIDGE_SELF_WORKSPACE+x}" || -n "${CMUX_BRIDGE_SELF_SURFACE+x}" ]]
+}
+
+# Validate one self-env value. Allowed values are only a prefixed ref or UUID.
+# Why: reject bare indexes, empty values, whitespace, control chars, and slash
+# before passing the value to `cmux identify`. Bare indexes depend on focus
+# context, which defeats the purpose of explicit self resolution.
+# The regex uses fixed anchors. Bash [[ =~ ]] has no REG_NEWLINE, so `$` is the
+# real string end; trailing newlines and embedded control chars are rejected.
+is_valid_self_env_value() {
+    local value="$1"
+    local ref_prefix="$2"
+    [[ "$value" =~ ^${ref_prefix}:[0-9]+$ ]] && return 0
+    [[ "$value" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] && return 0
+    return 1
+}
+
+# Return identify JSON for explicit self resolution when self env is set.
+# This resolves "self" for reply-to construction and is independent of the
+# target surface.
+# Return values:
+#   - stdout: cmux identify --workspace --surface --json output on success
+#   - exit 0: self identify succeeded
+#   - exit 2: configuration error; no fallback to plain identify
+#   - exit 1: identify command failed
+# Validation order is part of the contract: pair completeness, workspace value,
+# then surface value.
+resolve_self_json_via_env() {
+    local self_ws="$1"
+    local self_surf="$2"
+
+    # XOR: setting only one value is a configuration error. Do not fall back to
+    # plain identify, because that would hide the mistake and may build a wrong
+    # reply-to.
+    if [[ -z "$self_ws" || -z "$self_surf" ]]; then
+        echo "cmux-bridge: set both CMUX_BRIDGE_SELF_WORKSPACE and CMUX_BRIDGE_SELF_SURFACE; setting only one is invalid" >&2
+        return 2
+    fi
+    if ! is_valid_self_env_value "$self_ws" workspace; then
+        echo "cmux-bridge: CMUX_BRIDGE_SELF_WORKSPACE must be workspace:N or UUID; bare indexes are not allowed" >&2
+        return 2
+    fi
+    if ! is_valid_self_env_value "$self_surf" surface; then
+        echo "cmux-bridge: CMUX_BRIDGE_SELF_SURFACE must be surface:N or UUID; bare indexes are not allowed" >&2
+        return 2
+    fi
+
+    local json
+    if ! json="$(cmux identify --workspace "$self_ws" --surface "$self_surf" --json 2>&1)"; then
+        echo "cmux-bridge: failed to run 'cmux identify --workspace --surface --json'; check that cmux is running" >&2
+        echo "  details: $json" >&2
+        return 1
+    fi
+    printf '%s' "$json"
+}
+
+# Extract caller.surface_ref from cmux identify JSON.
+# Python 3 is acceptable because it is already a runtime requirement.
+# This distinguishes user-facing failure classes:
+#   (1) cmux identify failed, usually cmux is not running or the socket is unreachable
+#   (2) JSON parsing failed
+#   (3) caller is missing or has an unexpected type
+#   (4) caller or caller.surface_ref is null, meaning execution is outside cmux
+# Python catches exceptions so users do not see tracebacks.
+current_surface() {
+    local self_ws="${CMUX_BRIDGE_SELF_WORKSPACE-}"
+    local self_surf="${CMUX_BRIDGE_SELF_SURFACE-}"
+
+    # If either self-env value is set, use the self-env path and preserve the
+    # helper exit code. `! ...` would overwrite $? with 0, so capture manually.
+    local json
+    if has_self_env_request; then
+        local self_status
+        set +e
+        json="$(resolve_self_json_via_env "$self_ws" "$self_surf")"
+        self_status=$?
+        set -e
+        if (( self_status != 0 )); then
+            return "$self_status"
+        fi
+    elif ! json="$(cmux identify --json 2>&1)"; then
+        echo "cmux-bridge: failed to run 'cmux identify --json'; check that cmux is running" >&2
+        echo "  details: $json" >&2
+        return 1
+    fi
+
+    # Preserve Python exit codes. Python exit 4 means caller is null, so the
+    # command was run outside a cmux surface.
+    local ref py_status
+    set +e
+    ref="$(printf '%s' "$json" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except json.JSONDecodeError as e:
+    sys.stderr.write("failed to parse JSON: " + str(e) + "\n")
+    sys.exit(2)
+caller = data.get("caller")
+if caller is None:
+    # Outside cmux, cmux returns {"caller": null, "focused": ...}. This is not a
+    # schema violation; it means there is no caller surface.
+    sys.exit(4)
+if not isinstance(caller, dict):
+    sys.stderr.write("caller object has an unexpected type; possible schema change\n")
+    sys.exit(3)
+ref = caller.get("surface_ref")
+if ref is None:
+    # Treat a null surface_ref as outside cmux too.
+    sys.exit(4)
+print(ref)
+' 2>&1)"
+    py_status=$?
+    set -e
+
+    # Map Python exit 4 (outside cmux) to wrapper exit 8, avoiding conflict with
+    # wrapper exit 4 for bridge message format violations.
+    if (( py_status == 4 )); then
+        echo "cmux-bridge: cannot run outside a cmux surface; run inside a cmux terminal pane or tab" >&2
+        echo "  CMUX_SURFACE_ID is unset or cmux identify returned caller=null" >&2
+        return 8
+    fi
+    if (( py_status != 0 )); then
+        echo "cmux-bridge: failed to interpret 'cmux identify --json' output; cmux schema may have changed" >&2
+        echo "  details: $ref" >&2
+        return "$py_status"
+    fi
+
+    printf '%s\n' "$ref"
+}
+
+# Reject extra args early. Ignoring them would hide quoting bugs or typos.
+reject_extra_args() {
+    local subcommand="$1"
+    shift
+    if (( $# > 0 )); then
+        echo "cmux-bridge: '$subcommand' takes no arguments; received: $*" >&2
+        return 2
+    fi
+}
+
+is_valid_workspace_ref() {
+    [[ "$1" =~ ^[A-Za-z0-9:_-]+$ ]]
+}
+
+# Workspace refs are passed as cmux args and can appear in errors/logs.
+# Why: use the same minimal whitelist as targets to reduce terminal injection
+# surface from control characters or whitespace.
+parse_workspace_value() {
+    local value="${1:-}"
+    if [[ -z "$value" ]]; then
+        echo "cmux-bridge: '--workspace' requires a workspace ref" >&2
+        return 2
+    fi
+    if ! is_valid_workspace_ref "$value"; then
+        echo "cmux-bridge: workspace ref contains invalid characters; only alnum, ':', '_', and '-' are allowed" >&2
+        return 6
+    fi
+    PARSED_WORKSPACE="$value"
+}
+
+parse_workspace_only_args() {
+    local subcommand="$1"
+    shift
+    PARSED_WORKSPACE=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --workspace)
+                if (( $# < 2 )); then
+                    echo "cmux-bridge: '--workspace' requires a workspace ref" >&2
+                    return 2
+                fi
+                parse_workspace_value "$2" || return $?
+                shift 2
+                ;;
+            --*)
+                echo "cmux-bridge: unknown flag for '$subcommand'" >&2
+                return 2
+                ;;
+            *)
+                echo "cmux-bridge: '$subcommand' takes no arguments; received: $*" >&2
+                return 2
+                ;;
+        esac
+    done
+}
+
+cmd_id() {
+    reject_extra_args id "$@"
+    current_surface
+}
+
+cmd_list() {
+    parse_workspace_only_args list "$@" || return $?
+    # Pass through cmux list-panels output as-is. It is not JSON, so the caller
+    # is responsible for reading it.
+    if [[ -n "$PARSED_WORKSPACE" ]]; then
+        cmux list-panels --workspace "$PARSED_WORKSPACE"
+    else
+        cmux list-panels
+    fi
+}
+
+# Thin wrapper around cmux read-screen.
+# Args: <surface-ref> [lines]
+#   - surface-ref is required to avoid accidental self reads or wrong targets.
+#   - without lines, read the visible viewport; with lines, pass --lines N.
+cmd_read() {
+    PARSED_WORKSPACE=""
+    while [[ "${1:-}" == --* ]]; do
+        case "$1" in
+            --workspace)
+                if (( $# < 2 )); then
+                    echo "cmux-bridge: '--workspace' requires a workspace ref" >&2
+                    return 2
+                fi
+                parse_workspace_value "$2" || return $?
+                shift 2
+                ;;
+            *)
+                echo "cmux-bridge: unknown flag for 'read'" >&2
+                return 2
+                ;;
+        esac
+    done
+
+    if (( $# < 1 )); then
+        echo "cmux-bridge: 'read' requires surface-ref, e.g. cmux-bridge read surface:2 20" >&2
+        return 1
+    fi
+    if (( $# > 2 )); then
+        echo "cmux-bridge: 'read' accepts at most 2 arguments; received: $*" >&2
+        return 2
+    fi
+
+    local surface="$1"
+    local output
+    if (( $# == 2 )); then
+        local lines="$2"
+        if [[ -n "$PARSED_WORKSPACE" ]]; then
+            output="$(cmux read-screen --workspace "$PARSED_WORKSPACE" --surface "$surface" --lines "$lines")"
+        else
+            output="$(cmux read-screen --surface "$surface" --lines "$lines")"
+        fi
+    else
+        if [[ -n "$PARSED_WORKSPACE" ]]; then
+            output="$(cmux read-screen --workspace "$PARSED_WORKSPACE" --surface "$surface")"
+        else
+            output="$(cmux read-screen --surface "$surface")"
+        fi
+    fi
+
+    printf '%s' "$output"
+}
+
+# Shared parser for send / submit / key:
+# [--workspace W] [--force] <arg1> <arg2>.
+# Bash 3.x has no namerefs, so parsed values are returned through globals.
+parse_force_and_two_args() {
+    local subcommand="$1"
+    shift
+    PARSED_FORCE=0
+    PARSED_WORKSPACE=""
+    while [[ "${1:-}" == --* ]]; do
+        case "$1" in
+            --force)
+                PARSED_FORCE=1
+                shift
+                ;;
+            --workspace)
+                if (( $# < 2 )); then
+                    echo "cmux-bridge: '--workspace' requires a workspace ref" >&2
+                    return 2
+                fi
+                parse_workspace_value "$2" || return $?
+                shift 2
+                ;;
+            *)
+                echo "cmux-bridge: unknown flag for '$subcommand'" >&2
+                return 2
+                ;;
+        esac
+    done
+    if (( $# < 2 )); then
+        echo "cmux-bridge: '$subcommand' requires <surface> and a second argument" >&2
+        return 1
+    fi
+    if (( $# > 2 )); then
+        echo "cmux-bridge: '$subcommand' takes exactly 2 arguments; received: $#" >&2
+        return 2
+    fi
+    PARSED_ARG1="$1"
+    PARSED_ARG2="$2"
+}
+
+# Split cmux calls by whether workspace is set.
+# Why: preserve the existing same-workspace arg shape while making cross-
+# workspace sends validate and deliver in the same workspace context.
+cmux_send_text() {
+    local target="$1"
+    local text="$2"
+    local workspace="${3:-}"
+    if [[ -n "$workspace" ]]; then
+        cmux send --workspace "$workspace" --surface "$target" -- "$text"
+    else
+        cmux send --surface "$target" -- "$text"
+    fi
+}
+
+cmux_send_key_event() {
+    local target="$1"
+    local key="$2"
+    local workspace="${3:-}"
+    if [[ -n "$workspace" ]]; then
+        cmux send-key --workspace "$workspace" --surface "$target" -- "$key"
+    else
+        cmux send-key --surface "$target" -- "$key"
+    fi
+}
+
+# Thin wrapper around cmux send. Args: [--force] <surface> <text>.
+# Callers must quote text correctly when it contains shell special characters.
+cmd_send() {
+    parse_force_and_two_args send "$@" || return $?
+    check_target_surface "$PARSED_ARG1" "$PARSED_FORCE" "$PARSED_WORKSPACE" || return $?
+    cmux_send_text "$PARSED_ARG1" "$PARSED_ARG2" "$PARSED_WORKSPACE"
+}
+
+# Same as send, but injects an Enter key event afterward.
+# Why: TUIs running in termios raw mode distinguish an LF byte from an Enter key
+# event, so text can otherwise remain unsent in the prompt.
+cmd_submit() {
+    parse_force_and_two_args submit "$@" || return $?
+    check_target_surface "$PARSED_ARG1" "$PARSED_FORCE" "$PARSED_WORKSPACE" || return $?
+    cmux_send_text "$PARSED_ARG1" "$PARSED_ARG2" "$PARSED_WORKSPACE"
+    cmux_send_key_event "$PARSED_ARG1" enter "$PARSED_WORKSPACE"
+}
+
+# Get a target surface_type such as "terminal" or "browser".
+# Reads caller.surface_type from `cmux identify --surface <target> --json`.
+# Missing surfaces return null, which this function maps to an empty string.
+# Return values:
+#   - stdout: surface_type, or empty for null
+#   - exit 0: successful lookup
+#   - exit 1: cmux identify failed
+#   - exit 2: JSON parse failed
+get_surface_type() {
+    local target="$1"
+    local workspace="${2:-}"
+    # cmux identify behavior:
+    #   (A) success: JSON beginning with `{`
+    #   (B) invalid target: non-zero output containing not-found wording
+    #   (C) infrastructure failure: socket/connectivity output, non-zero
+    # Exit codes alone do not distinguish (B) from (C), so inspect output.
+    # Do not reflect infrastructure details; they may contain control chars.
+    local json
+    set +e
+    if [[ -n "$workspace" ]]; then
+        json="$(cmux identify --workspace "$workspace" --surface "$target" --json 2>&1)"
+    else
+        json="$(cmux identify --surface "$target" --json 2>&1)"
+    fi
+    set -e
+
+    if [[ "$json" != "{"* ]]; then
+        # Classify non-JSON output conservatively as target vs infrastructure.
+        # Do not use bare "invalid"; it can also appear in infrastructure errors.
+        local low
+        low="$(printf '%s' "$json" | tr '[:upper:]' '[:lower:]')"
+        if [[ "$low" == *"not found"* || "$low" == *"no such"* || "$low" == *"does not exist"* ]]; then
+            printf ''
+            return 0
+        fi
+        echo "cmux-bridge: failed to run 'cmux identify --surface'; possible cmux socket or infrastructure problem" >&2
+        return 1
+    fi
+
+    # Parse JSON and extract caller.surface_type.
+    # Python exit 2 means parse failure; exit 3 means schema change.
+    # Only surface_type=null is treated as target-not-found.
+    local stype py_status
+    set +e
+    stype="$(printf '%s' "$json" | python3 -c '
+import json, sys
+raw = sys.stdin.read()
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError as e:
+    sys.stderr.write("failed to parse JSON: " + str(e) + "\n")
+    sys.exit(2)
+caller = data.get("caller")
+if not isinstance(caller, dict):
+    sys.stderr.write("caller object missing or invalid; schema violation\n")
+    sys.exit(3)
+if "surface_type" not in caller:
+    sys.stderr.write("caller.surface_type key is missing; schema violation\n")
+    sys.exit(3)
+t = caller["surface_type"]
+# surface_type=null means invalid target. Return empty and let bash map to exit 6.
+print("" if t is None else t)
+' 2>&1)"
+    py_status=$?
+    set -e
+
+    if (( py_status != 0 )); then
+        # Parse and schema failures are infrastructure/schema problems, not
+        # target mistakes.
+        echo "cmux-bridge: failed to interpret 'cmux identify' output; cmux schema may have changed" >&2
+        return 1
+    fi
+
+    printf '%s' "$stype"
+}
+
+# Resolve any target identifier to canonical `surface:N`.
+# Used as a fallback for bare index, UUID, and hierarchical refs.
+# Return values:
+#   - stdout: canonical `surface:N` on success
+#   - exit 0: resolved
+#   - exit 1: unresolved or cmux identify failed
+# Callers skip self-loop canonical comparison if this fails and let later
+# surface_type checks handle invalid targets.
+resolve_target_ref() {
+    local target="$1"
+    local workspace="${2:-}"
+    local json
+    set +e
+    if [[ -n "$workspace" ]]; then
+        json="$(cmux identify --workspace "$workspace" --surface "$target" --json 2>&1)"
+    else
+        json="$(cmux identify --surface "$target" --json 2>&1)"
+    fi
+    set -e
+
+    # Same broad branch as get_surface_type. For resolution, both target and
+    # infrastructure failures mean "unresolved".
+    if [[ "$json" != "{"* ]]; then
+        return 1
+    fi
+
+    local ref py_status
+    set +e
+    ref="$(printf '%s' "$json" | python3 -c '
+import json, sys
+try:
+    data = json.loads(sys.stdin.read())
+except json.JSONDecodeError:
+    sys.exit(2)
+caller = data.get("caller")
+if not isinstance(caller, dict):
+    sys.exit(3)
+ref = caller.get("surface_ref")
+if ref is None:
+    # Invalid target, such as a surface:N from another workspace.
+    sys.exit(4)
+print(ref)
+' 2>/dev/null)"
+    py_status=$?
+    set -e
+
+    if (( py_status != 0 )); then
+        return 1
+    fi
+    printf '%s\n' "$ref"
+}
+
+# Validate target syntax and reject self-loops. Never skip this for --force.
+# Target syntax validation reduces terminal injection risk through errors or
+# cmux arguments. Self-loop rejection prevents an agent from replying to itself
+# forever; enforce it in the wrapper instead of relying only on SKILL.md.
+#
+# Self-loop detection has two stages:
+#   (1) fast path: if target is `surface:N` or hierarchical `.../surface:N`,
+#       compare strings without calling cmux identify.
+#   (2) canonicalize path: resolve bare indexes and UUIDs to canonical
+#       `surface:N` before comparing.
+#
+# Return values:
+#   - 0: OK, or unable to determine self/canonical target
+#   - 6: invalid target characters
+#   - 9: target equals self surface
+check_target_syntax_and_self_loop() {
+    local target="$1"
+    local workspace="${2:-}"
+    CHECKED_SELF_SURFACE=""
+
+    # cmux accepts refs, indexes, UUIDs, and hierarchical refs. Allow the
+    # minimal character set needed for those and let cmux validate structure.
+    if [[ ! "$target" =~ ^[A-Za-z0-9:/_-]+$ ]]; then
+        echo "cmux-bridge: target surface contains invalid characters; only alnum, ':', '/', '_', and '-' are allowed" >&2
+        return 6
+    fi
+
+    # Self-loop detection only runs when current_surface is available. If self
+    # cannot be resolved outside cmux, later checks handle the failure.
+    local self self_status
+    set +e
+    if has_self_env_request; then
+        self="$(current_surface)"
+    else
+        self="$(current_surface 2>/dev/null)"
+    fi
+    self_status=$?
+    set -e
+    if (( self_status != 0 )); then
+        if has_self_env_request; then
+            return "$self_status"
+        fi
+        return 0
+    fi
+    CHECKED_SELF_SURFACE="$self"
+    # Normalize hierarchical refs like `workspace:24/surface:5` to `surface:5`.
+    local self_ref="${self##*/}"
+    local target_tail="${target##*/}"
+
+    # Fast path for `surface:N` and `.../surface:N`; avoids cmux identify.
+    if [[ "$target_tail" =~ ^surface:[0-9]+$ ]]; then
+        if [[ "$self_ref" == "$target_tail" ]]; then
+            echo "cmux-bridge: target equals this surface; refusing to prevent a self-loop, even with --force" >&2
+            return 9
+        fi
+        return 0
+    fi
+
+    # Canonicalize fallback for bare indexes, UUIDs, and other accepted forms.
+    # If resolution fails, defer to later surface_type checks.
+    local resolved
+    if resolved="$(resolve_target_ref "$target" "$workspace" 2>/dev/null)"; then
+        if [[ "$self_ref" == "$resolved" ]]; then
+            echo "cmux-bridge: target equals this surface; refusing to prevent a self-loop, even with --force" >&2
+            return 9
+        fi
+    fi
+    return 0
+}
+
+# Precheck that the target surface is a terminal.
+# - force=1 skips only surface_type validation; syntax and self-loop checks
+#   always run.
+# - invalid or missing target -> exit 6
+# - target equals self -> exit 9
+# - non-terminal target -> exit 7
+#
+# Do not echo target or stype values in errors; they may contain control chars.
+check_target_surface() {
+    local target="$1"
+    local force="$2"
+    local workspace="${3:-}"
+
+    # --force only bypasses surface_type validation.
+    check_target_syntax_and_self_loop "$target" "$workspace" || return $?
+
+    if (( force == 1 )); then
+        return 0
+    fi
+
+    local stype get_status
+    set +e
+    stype="$(get_surface_type "$target" "$workspace")"
+    get_status=$?
+    set -e
+    if (( get_status != 0 )); then
+        return "$get_status"
+    fi
+
+    if [[ -z "$stype" ]]; then
+        echo "cmux-bridge: target surface does not exist or is invalid; --force can bypass this but may fail" >&2
+        return 6
+    fi
+    if [[ "$stype" != "terminal" ]]; then
+        # Do not print stype itself; a schema change could include control chars.
+        echo "cmux-bridge: target surface is not a terminal; refusing to send unless --force is used" >&2
+        return 7
+    fi
+    return 0
+}
+
+# Check for empty body or characters that are invalid in bridge message bodies.
+# Invalid means:
+#   - empty string; receivers require body length >= 1
+#   - ASCII control characters, including NL, CR, TAB, ESC, BS
+#   - literal cmux escape sequences \n, \r, \t
+contains_forbidden_body_chars() {
+    local s="$1"
+    [[ -z "$s" || "$s" =~ [[:cntrl:]] || "$s" == *'\n'* || "$s" == *'\r'* || "$s" == *'\t'* ]]
+}
+
+# Sender metadata is embedded directly in the bridge message header. Spaces,
+# `]`, and control chars could corrupt the header or manipulate the terminal.
+# Allow only ASCII alnum plus . _ -. Empty strings fail because `+` requires at
+# least one character.
+is_valid_sender() {
+    [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+# Send a bridge message with sender metadata.
+# Output format: [cmux-bridge from:<sender> reply-to:<my-surface>] <body>\n
+# Sender resolution order: CMUX_AGENT_NAME, CLAUDECODE=="1",
+# non-empty CODEX_THREAD_ID, then whoami.
+# Body and sender must not contain newlines, tabs, control chars, or cmux
+# escape sequences.
+# --dry-run prints the payload without sending.
+# --force skips surface_type precheck only.
+cmd_message() {
+    local dry_run=0
+    local force=0
+    local workspace=""
+    while [[ "${1:-}" == --* ]]; do
+        case "$1" in
+            --dry-run) dry_run=1 ;;
+            --force) force=1 ;;
+            --workspace)
+                if (( $# < 2 )); then
+                    echo "cmux-bridge: '--workspace' requires a workspace ref" >&2
+                    return 2
+                fi
+                PARSED_WORKSPACE=""
+                parse_workspace_value "$2" || return $?
+                workspace="$PARSED_WORKSPACE"
+                shift
+                ;;
+            *)
+                # Do not reflect unknown flag values into stderr.
+                echo "cmux-bridge: unknown flag for 'message'" >&2
+                return 2
+                ;;
+        esac
+        shift
+    done
+
+    if (( $# < 2 )); then
+        echo "cmux-bridge: 'message' requires <target-surface> <body>" >&2
+        return 1
+    fi
+    if (( $# > 2 )); then
+        # Do not echo extra arg values; they may contain terminal control bytes.
+        echo "cmux-bridge: 'message' takes exactly 2 arguments; received: $#" >&2
+        return 2
+    fi
+
+    local target="$1"
+    local body="$2"
+
+    # Dry-run skips surface_type precheck because the target does not need to
+    # exist for payload inspection. Syntax and self-loop checks still run so a
+    # dry-run payload cannot be copied into a self-looping real send.
+    if (( dry_run == 0 )); then
+        check_target_surface "$target" "$force" "$workspace" || return $?
+    else
+        check_target_syntax_and_self_loop "$target" "$workspace" || return $?
+    fi
+
+    # Bridge message format rejects control chars and literal cmux escape
+    # sequences \n / \r / \t in the body.
+    if contains_forbidden_body_chars "$body"; then
+        printf 'cmux-bridge: %s\n' "'message' body cannot contain control characters or cmux escape sequences \\n / \\r / \\t" >&2
+        return 4
+    fi
+
+    # Resolve sender inline instead of via command substitution. Bash command
+    # substitution silently strips trailing newlines, which could let a malicious
+    # CMUX_AGENT_NAME bypass validation.
+    local sender
+    if [[ -n "${CMUX_AGENT_NAME:-}" ]]; then
+        sender="$CMUX_AGENT_NAME"
+    elif [[ "${CLAUDECODE:-}" == "1" ]]; then
+        sender='claude-code'
+    elif [[ -n "${CODEX_THREAD_ID:-}" ]]; then
+        sender='codex'
+    else
+        sender="$(whoami)"
+    fi
+    if ! is_valid_sender "$sender"; then
+        # Do not echo the invalid sender value; it may contain escape bytes.
+        echo "cmux-bridge: 'message' sender is empty or contains characters outside alnum . _ -; check CMUX_AGENT_NAME" >&2
+        return 4
+    fi
+
+    # Preserve current_surface exit code; `if ! ...` would reset $? to 0.
+    local my_surface surface_status
+    if [[ -n "${CHECKED_SELF_SURFACE:-}" ]]; then
+        # Reuse the self already resolved for self-loop checks; message uses the
+        # same self for reply-to.
+        my_surface="$CHECKED_SELF_SURFACE"
+    else
+        set +e
+        my_surface="$(current_surface)"
+        surface_status=$?
+        set -e
+        if (( surface_status != 0 )); then
+            return "$surface_status"
+        fi
+    fi
+
+    # Defensive validation: keep unexpected cmux schema changes or control chars
+    # out of the bridge header.
+    if [[ ! "$my_surface" =~ ^surface:[0-9]+$ ]]; then
+        echo "cmux-bridge: 'message' reply-to self surface is not in expected 'surface:N' format; cmux schema may have changed" >&2
+        return 5
+    fi
+
+    local payload="[cmux-bridge from:${sender} reply-to:${my_surface}] ${body}"
+
+    if (( dry_run == 1 )); then
+        printf '%s\n' "$payload"
+        return 0
+    fi
+
+    # Send text, then send an Enter key event. TUIs in termios raw mode can
+    # distinguish LF bytes from Enter key events, so a separate send-key call is
+    # required for reliable submission.
+    cmux_send_text "$target" "$payload" "$workspace"
+    cmux_send_key_event "$target" enter "$workspace"
+}
+
+# Thin wrapper around cmux send-key. Args: [--force] <surface> <key>.
+cmd_key() {
+    parse_force_and_two_args key "$@" || return $?
+    check_target_surface "$PARSED_ARG1" "$PARSED_FORCE" "$PARSED_WORKSPACE" || return $?
+    cmux_send_key_event "$PARSED_ARG1" "$PARSED_ARG2" "$PARSED_WORKSPACE"
+}
+
+# Slash command helper for sending `/clear` to a target surface.
+# Unlike message, this intentionally omits the bridge header because slash
+# commands must start with `/`. The body is fixed to `/clear` to avoid creating
+# an arbitrary text injection command path.
+cmd_clear() {
+    local force=0
+    PARSED_WORKSPACE=""
+    while [[ "${1:-}" == --* ]]; do
+        case "$1" in
+            --force)
+                force=1
+                shift
+                ;;
+            --workspace)
+                if (( $# < 2 )); then
+                    echo "cmux-bridge: '--workspace' requires a workspace ref" >&2
+                    return 2
+                fi
+                parse_workspace_value "$2" || return $?
+                shift 2
+                ;;
+            *)
+                echo "cmux-bridge: unknown flag for 'clear'" >&2
+                return 2
+                ;;
+        esac
+    done
+    if (( $# < 1 )); then
+        echo "cmux-bridge: 'clear' requires <surface>" >&2
+        return 1
+    fi
+    if (( $# > 1 )); then
+        echo "cmux-bridge: 'clear' takes exactly 1 argument; received: $#" >&2
+        return 2
+    fi
+    local target="$1"
+    check_target_surface "$target" "$force" "$PARSED_WORKSPACE" || return $?
+    # Why: cmux send appends to existing prompt input. Clear the input first so
+    # `/clear` starts at the beginning and is parsed as a slash command. ctrl+u
+    # clears from line start to cursor in shells and common AI TUIs.
+    cmux_send_key_event "$target" ctrl+u "$PARSED_WORKSPACE"
+    # Same Enter handling as message: send text, then a real Enter key event.
+    cmux_send_text "$target" "/clear" "$PARSED_WORKSPACE"
+    cmux_send_key_event "$target" enter "$PARSED_WORKSPACE"
+}
+
+main() {
+    if (( $# == 0 )); then
+        usage >&2
+        exit 1
+    fi
+
+    local subcommand="$1"
+    shift
+
+    case "$subcommand" in
+        -h|--help|help)
+            usage
+            ;;
+        id)
+            cmd_id "$@"
+            ;;
+        list)
+            cmd_list "$@"
+            ;;
+        read)
+            cmd_read "$@"
+            ;;
+        send)
+            cmd_send "$@"
+            ;;
+        submit)
+            cmd_submit "$@"
+            ;;
+        key)
+            cmd_key "$@"
+            ;;
+        message)
+            cmd_message "$@"
+            ;;
+        clear)
+            cmd_clear "$@"
+            ;;
+        *)
+            echo "cmux-bridge: unknown subcommand '$subcommand'" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,8 @@
+.DS_Store
+*.log
+*.tmp
+*.bak
+
+# Local editor and tool state.
+.claude/settings.local.json
+.codex/

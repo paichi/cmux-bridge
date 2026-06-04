@@ -1,0 +1,4 @@
+interface:
+  display_name: "cmux Bridge"
+  short_description: "Bridge messages between agents running in cmux panes"
+  default_prompt: "Use $cmux-bridge to send a question to another agent running in a cmux pane or reply to a received bridge message."
