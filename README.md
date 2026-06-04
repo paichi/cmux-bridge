@@ -147,3 +147,7 @@ scripts/cmux-bridge
 ```
 
 `SKILL.md` contains the instructions for agents. `agents/openai.yaml` contains OpenAI/Codex UI metadata. `scripts/cmux-bridge` is the wrapper that sends messages through cmux.
+
+## License
+
+MIT
