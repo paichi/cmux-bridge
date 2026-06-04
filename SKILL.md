@@ -22,17 +22,24 @@ the user and stop.
 
 ## Command Path
 
-Examples use `cmux-bridge ...` as shorthand for the bundled wrapper:
+The wrapper ships with this skill at `scripts/cmux-bridge`. Its install location
+varies by agent and installer, so resolve it once instead of hardcoding a fixed
+path. The wrapper always lives next to this `SKILL.md`, inside the skill
+directory you loaded it from.
 
 ```bash
-BRIDGE="$HOME/.claude/skills/cmux-bridge/scripts/cmux-bridge"
+BRIDGE=""
+for d in "$HOME/.claude/skills/cmux-bridge" \
+         "$HOME/.codex/skills/cmux-bridge" \
+         "$HOME/.agents/skills/cmux-bridge"; do
+  [ -x "$d/scripts/cmux-bridge" ] && BRIDGE="$d/scripts/cmux-bridge" && break
+done
 self="$("$BRIDGE" id)"
 ```
 
-Common locations:
-
-- Claude Code: `~/.claude/skills/cmux-bridge/scripts/cmux-bridge`
-- Codex CLI: `~/.codex/skills/cmux-bridge/scripts/cmux-bridge`
+`npx skills` installs into the shared `~/.agents/skills` location. If none of the
+paths above match your setup, use `scripts/cmux-bridge` inside this skill's own
+directory.
 
 Whenever this document says `cmux-bridge id`, read it as `"$BRIDGE" id`.
 
