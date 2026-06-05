@@ -36,7 +36,9 @@ Claude Code and Codex CLI detect slash commands only when `/` is the first chara
 # Clear a Claude Code pane in the same workspace.
 cmux-bridge clear surface:104
 
-# Clear a Claude Code pane in another workspace.
+# A pane in another workspace can be cleared without --workspace (auto-resolved).
+cmux-bridge clear surface:33
+# Explicit --workspace still works and takes precedence:
 cmux-bridge clear --workspace workspace:11 surface:33
 ```
 

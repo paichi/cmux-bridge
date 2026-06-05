@@ -15,6 +15,15 @@ set -euo pipefail
 # global state cannot leak across invocations.
 CHECKED_SELF_SURFACE=""
 
+# Resolved target workspace for the current invocation.
+# Why: `reply-to:surface:N` carries no workspace, so a responder in another
+# workspace replying without `--workspace` cannot resolve the target in its own
+# caller context and fails with exit 6. `resolve_effective_workspace` reverse-
+# looks-up the owning workspace via `cmux tree` and stores it here so that
+# check_target_surface / cmux_send_* / read-screen all reuse the same value.
+# One subcommand per process, so this global cannot leak across invocations.
+EFFECTIVE_WORKSPACE=""
+
 usage() {
     cat <<'EOF'
 Usage: cmux-bridge <subcommand> [args...]
@@ -305,17 +314,20 @@ cmd_read() {
     fi
 
     local surface="$1"
+    # read does not go through check_target_surface, but resolve only calls tree
+    # and does not add an identify (D2).
+    resolve_effective_workspace "$surface" "$PARSED_WORKSPACE"
     local output
     if (( $# == 2 )); then
         local lines="$2"
-        if [[ -n "$PARSED_WORKSPACE" ]]; then
-            output="$(cmux read-screen --workspace "$PARSED_WORKSPACE" --surface "$surface" --lines "$lines")"
+        if [[ -n "$EFFECTIVE_WORKSPACE" ]]; then
+            output="$(cmux read-screen --workspace "$EFFECTIVE_WORKSPACE" --surface "$surface" --lines "$lines")"
         else
             output="$(cmux read-screen --surface "$surface" --lines "$lines")"
         fi
     else
-        if [[ -n "$PARSED_WORKSPACE" ]]; then
-            output="$(cmux read-screen --workspace "$PARSED_WORKSPACE" --surface "$surface")"
+        if [[ -n "$EFFECTIVE_WORKSPACE" ]]; then
+            output="$(cmux read-screen --workspace "$EFFECTIVE_WORKSPACE" --surface "$surface")"
         else
             output="$(cmux read-screen --surface "$surface")"
         fi
@@ -393,8 +405,9 @@ cmux_send_key_event() {
 # Callers must quote text correctly when it contains shell special characters.
 cmd_send() {
     parse_force_and_two_args send "$@" || return $?
-    check_target_surface "$PARSED_ARG1" "$PARSED_FORCE" "$PARSED_WORKSPACE" || return $?
-    cmux_send_text "$PARSED_ARG1" "$PARSED_ARG2" "$PARSED_WORKSPACE"
+    resolve_effective_workspace "$PARSED_ARG1" "$PARSED_WORKSPACE"
+    check_target_surface "$PARSED_ARG1" "$PARSED_FORCE" "$EFFECTIVE_WORKSPACE" || return $?
+    cmux_send_text "$PARSED_ARG1" "$PARSED_ARG2" "$EFFECTIVE_WORKSPACE"
 }
 
 # Same as send, but injects an Enter key event afterward.
@@ -402,9 +415,10 @@ cmd_send() {
 # event, so text can otherwise remain unsent in the prompt.
 cmd_submit() {
     parse_force_and_two_args submit "$@" || return $?
-    check_target_surface "$PARSED_ARG1" "$PARSED_FORCE" "$PARSED_WORKSPACE" || return $?
-    cmux_send_text "$PARSED_ARG1" "$PARSED_ARG2" "$PARSED_WORKSPACE"
-    cmux_send_key_event "$PARSED_ARG1" enter "$PARSED_WORKSPACE"
+    resolve_effective_workspace "$PARSED_ARG1" "$PARSED_WORKSPACE"
+    check_target_surface "$PARSED_ARG1" "$PARSED_FORCE" "$EFFECTIVE_WORKSPACE" || return $?
+    cmux_send_text "$PARSED_ARG1" "$PARSED_ARG2" "$EFFECTIVE_WORKSPACE"
+    cmux_send_key_event "$PARSED_ARG1" enter "$EFFECTIVE_WORKSPACE"
 }
 
 # Get a target surface_type such as "terminal" or "browser".
@@ -605,6 +619,96 @@ check_target_syntax_and_self_loop() {
     return 0
 }
 
+# Reverse-look-up the workspace that owns a canonical `surface:N` by walking
+# `cmux tree --all --json` (D2). Why: `reply-to:surface:N` carries no workspace,
+# so a responder in another workspace replying without `--workspace` resolves in
+# its own caller context and fails with exit 6. `surface:N` is globally unique
+# across workspaces, so the owning workspace can be reverse-looked-up from the
+# tree regardless of display formatting.
+# Degradation: cmux tree failure / broken JSON / 0 matches / multiple matches all
+# return an empty string, letting callers fall back silently to the caller
+# context (empty workspace) and the existing exit 6 / infra behavior (when
+# ambiguous, do not guess; never silently misdeliver).
+# Output: the uniquely resolved workspace ref on stdout (only when exactly one
+# match), empty otherwise. Always exits 0.
+lookup_surface_workspace() {
+    local target="$1"
+    local json tree_status result
+    set +e
+    json="$(cmux tree --all --json 2>/dev/null)"
+    tree_status=$?
+    set -e
+    if (( tree_status != 0 )); then
+        return 0
+    fi
+
+    # python3 ships with macOS (same dependency as get_surface_type). Swallow all
+    # exceptions and return empty so a tree schema change or corruption never
+    # routes a message to the wrong workspace.
+    set +e
+    result="$(printf '%s' "$json" | python3 -c '
+import json, sys
+target = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+found = set()
+for window in data.get("windows") or []:
+    for ws in window.get("workspaces") or []:
+        ref = ws.get("ref")
+        if not ref:
+            continue
+        for pane in ws.get("panes") or []:
+            for sref in pane.get("surface_refs") or []:
+                if sref == target:
+                    found.add(ref)
+# Adopt the result only when exactly one match. 0 / multiple -> empty (degrade).
+if len(found) == 1:
+    sys.stdout.write(next(iter(found)))
+' "$target" 2>/dev/null)"
+    set -e
+    printf '%s' "$result"
+    return 0
+}
+
+# Resolve the effective workspace for a target into global EFFECTIVE_WORKSPACE.
+# Contract:
+#   1. explicit --workspace given -> use it (no reverse-lookup)
+#   2. no --workspace and target is canonical `surface:N` (or `.../surface:N`)
+#      -> reverse-look-up exactly one owning workspace via the tree
+#   3. otherwise (bare index / UUID etc.) -> empty (caller-relative, legacy)
+# A 0/multiple/failure reverse-lookup yields empty (lookup_surface_workspace),
+# so callers degrade to the previous exit 6 / infra path instead of guessing.
+# Independent of self (reply-to) resolution: a target workspace is never reused
+# for self.
+resolve_effective_workspace() {
+    local target="$1"
+    local explicit_ws="${2:-}"
+    if [[ -n "$explicit_ws" ]]; then
+        EFFECTIVE_WORKSPACE="$explicit_ws"
+        return 0
+    fi
+    local target_tail="${target##*/}"
+    if [[ "$target_tail" =~ ^surface:[0-9]+$ ]]; then
+        # Validate the tree-derived ref with the same whitelist as an explicit
+        # --workspace. Why: `cmux tree --json` is external input; if it is
+        # corrupted and returns a ref containing whitespace/control chars, do not
+        # pass it downstream as --workspace -- degrade to an empty workspace
+        # (do not trust malformed cmux JSON / never silently misdeliver).
+        local resolved
+        resolved="$(lookup_surface_workspace "$target_tail")"
+        if is_valid_workspace_ref "$resolved"; then
+            EFFECTIVE_WORKSPACE="$resolved"
+        else
+            EFFECTIVE_WORKSPACE=""
+        fi
+    else
+        EFFECTIVE_WORKSPACE=""
+    fi
+    return 0
+}
+
 # Precheck that the target surface is a terminal.
 # - force=1 skips only surface_type validation; syntax and self-loop checks
 #   always run.
@@ -715,8 +819,11 @@ cmd_message() {
     # Dry-run skips surface_type precheck because the target does not need to
     # exist for payload inspection. Syntax and self-loop checks still run so a
     # dry-run payload cannot be copied into a self-looping real send.
+    # Dry-run also skips reverse-lookup (the resolver): the payload is workspace-
+    # independent, so there is no need to call `cmux tree`.
     if (( dry_run == 0 )); then
-        check_target_surface "$target" "$force" "$workspace" || return $?
+        resolve_effective_workspace "$target" "$workspace"
+        check_target_surface "$target" "$force" "$EFFECTIVE_WORKSPACE" || return $?
     else
         check_target_syntax_and_self_loop "$target" "$workspace" || return $?
     fi
@@ -780,15 +887,16 @@ cmd_message() {
     # Send text, then send an Enter key event. TUIs in termios raw mode can
     # distinguish LF bytes from Enter key events, so a separate send-key call is
     # required for reliable submission.
-    cmux_send_text "$target" "$payload" "$workspace"
-    cmux_send_key_event "$target" enter "$workspace"
+    cmux_send_text "$target" "$payload" "$EFFECTIVE_WORKSPACE"
+    cmux_send_key_event "$target" enter "$EFFECTIVE_WORKSPACE"
 }
 
 # Thin wrapper around cmux send-key. Args: [--force] <surface> <key>.
 cmd_key() {
     parse_force_and_two_args key "$@" || return $?
-    check_target_surface "$PARSED_ARG1" "$PARSED_FORCE" "$PARSED_WORKSPACE" || return $?
-    cmux_send_key_event "$PARSED_ARG1" "$PARSED_ARG2" "$PARSED_WORKSPACE"
+    resolve_effective_workspace "$PARSED_ARG1" "$PARSED_WORKSPACE"
+    check_target_surface "$PARSED_ARG1" "$PARSED_FORCE" "$EFFECTIVE_WORKSPACE" || return $?
+    cmux_send_key_event "$PARSED_ARG1" "$PARSED_ARG2" "$EFFECTIVE_WORKSPACE"
 }
 
 # Slash command helper for sending `/clear` to a target surface.
@@ -827,14 +935,15 @@ cmd_clear() {
         return 2
     fi
     local target="$1"
-    check_target_surface "$target" "$force" "$PARSED_WORKSPACE" || return $?
+    resolve_effective_workspace "$target" "$PARSED_WORKSPACE"
+    check_target_surface "$target" "$force" "$EFFECTIVE_WORKSPACE" || return $?
     # Why: cmux send appends to existing prompt input. Clear the input first so
     # `/clear` starts at the beginning and is parsed as a slash command. ctrl+u
     # clears from line start to cursor in shells and common AI TUIs.
-    cmux_send_key_event "$target" ctrl+u "$PARSED_WORKSPACE"
+    cmux_send_key_event "$target" ctrl+u "$EFFECTIVE_WORKSPACE"
     # Same Enter handling as message: send text, then a real Enter key event.
-    cmux_send_text "$target" "/clear" "$PARSED_WORKSPACE"
-    cmux_send_key_event "$target" enter "$PARSED_WORKSPACE"
+    cmux_send_text "$target" "/clear" "$EFFECTIVE_WORKSPACE"
+    cmux_send_key_event "$target" enter "$EFFECTIVE_WORKSPACE"
 }
 
 main() {

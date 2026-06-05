@@ -8,7 +8,7 @@ The core runtime rules remain in `SKILL.md`, so agents can follow the safety rul
 `npx skills` installs a skill into each agent's skill directory. It does not register bundled scripts on `PATH`.
 That is why the skill instructs agents to resolve the bundled `scripts/cmux-bridge` wrapper by absolute path.
 
-During local development, the repository root is also the skill directory, so the same `$BRIDGE` pattern works against the local `scripts/cmux-bridge`.
+During local development, the repository root is also the skill directory, so resolving `$BRIDGE` next to this `SKILL.md` points at the local `scripts/cmux-bridge`.
 
 ## Extracting a Received Message in Bash
 
@@ -25,13 +25,17 @@ When replying, use `reply-to` as the target exactly as received.
 
 ## Sending Across Workspaces
 
+A `surface:N` in another workspace can be targeted **without** `--workspace`; the wrapper reverse-looks-up its owning workspace automatically. A reply to a received `reply-to:surface:N` therefore reaches the other workspace as-is.
+
 ```bash
-# Send to a Claude Code pane in the `example-project` workspace.
+# No --workspace: the owning workspace is auto-resolved.
+cmux-bridge message surface:33 "[act:think id:review-1] Received. I will review it."
+
+# Explicit --workspace still works and takes precedence:
 cmux-bridge message --workspace workspace:11 surface:33 "[act:think id:review-1] Received. I will review it."
 ```
 
-Why: `surface:N` can look unique in the UI, but cmux validates it in the caller workspace context.
-When sending to a pane in another workspace, specify `--workspace` so target validation and delivery use the same context.
+Why: `surface:N` is globally unique across workspaces, so the wrapper resolves the owning workspace from `cmux tree --all --json` and aligns target validation and delivery to it. If the lookup is not unique (not found / multiple / tree failure), it does not guess: it degrades to the previous exit 6 instead of misdelivering. An explicit `--workspace` always wins.
 
 ## If cmux Context Is Missing
 
