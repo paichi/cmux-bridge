@@ -6,3 +6,6 @@
 # Local editor and tool state.
 .claude/settings.local.json
 .codex/
+
+# Internal approval/plan notes synced from the upstream workspace; never publish.
+plans/

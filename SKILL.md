@@ -22,17 +22,25 @@ the user and stop.
 
 ## Command Path
 
-Examples use `cmux-bridge ...` as shorthand for the bundled wrapper:
+The wrapper ships with this skill at `scripts/cmux-bridge`. Its install location
+varies by agent and installer, so use the copy that sits next to **this**
+`SKILL.md`. You know the absolute path you loaded this `SKILL.md` from, so use
+`scripts/cmux-bridge` inside that same skill directory. Do not hardcode a fixed
+`$HOME/...` path and do not probe a list of candidate locations.
 
 ```bash
-BRIDGE="$HOME/.claude/skills/cmux-bridge/scripts/cmux-bridge"
+# Use the directory this SKILL.md was loaded from. For example, if this
+# SKILL.md is ~/.agents/skills/cmux-bridge/SKILL.md:
+BRIDGE="$HOME/.agents/skills/cmux-bridge/scripts/cmux-bridge"
 self="$("$BRIDGE" id)"
 ```
 
-Common locations:
-
-- Claude Code: `~/.claude/skills/cmux-bridge/scripts/cmux-bridge`
-- Codex CLI: `~/.codex/skills/cmux-bridge/scripts/cmux-bridge`
+Why not probe a candidate list: with multiple installs (for example an older
+`~/.claude/skills` plus a newer `~/.agents/skills`), probing picks the first
+match, which may be a stale wrapper that does not match the `SKILL.md` you are
+reading. Always using the wrapper next to this `SKILL.md` keeps the wrapper and
+the skill in lockstep. (`npx skills` installs into the shared `~/.agents/skills`
+location.)
 
 Whenever this document says `cmux-bridge id`, read it as `"$BRIDGE" id`.
 
@@ -86,7 +94,8 @@ Rules:
 - Quote the body with `"..."`; escape inner `"` as `\"`.
 - Split multi-line content into separate `message` calls.
 - Do not use `--force` for bridge conversations.
-- Use `--workspace` only when targeting another workspace.
+- `--workspace` is usually unnecessary: a `surface:N` in another workspace is
+  resolved automatically. Pass it only to override; an explicit value wins.
 
 For cross-workspace details and sender override, read
 `references/command-details.md`.
@@ -175,7 +184,7 @@ roles; use numeric IDs only for precision.
 | 3 | cmux JSON schema violation | Report and stop |
 | 4 | Message format violation | Fix body or sender |
 | 5 | Invalid self surface ref | Check environment |
-| 6 | Invalid or missing target | Run `cmux-bridge list`; add `--workspace` if needed |
+| 6 | Invalid or missing target | A `surface:N` in another workspace is auto-resolved, but degrades to exit 6 when it cannot be resolved (not found / multiple / tree failure). Run `cmux-bridge list --workspace workspace:N` to confirm it exists |
 | 7 | Target is not terminal | Choose a terminal surface |
 | 8 | Running outside cmux context | Run from inside cmux |
 | 9 | Self-loop detected | Stop immediately; do not retry |
