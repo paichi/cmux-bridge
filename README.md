@@ -160,6 +160,12 @@ If replies do not work, the agent's shell commands may be running outside cmux. 
 
 Browser panes and other non-terminal panes cannot receive bridge messages.
 
+If a long message lands in the target's input box but is not submitted, the
+receiving TUI swallowed the Enter while ingesting the pasted text. The wrapper
+already sends a delayed double-enter to avoid this; if it still happens on a
+slow machine, raise the delay with `export CMUX_BRIDGE_COMMIT_DELAY=0.8`
+(seconds; default `0.4`).
+
 ## Included Files
 
 ```text

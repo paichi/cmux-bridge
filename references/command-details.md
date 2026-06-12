@@ -56,6 +56,34 @@ Sender detection order:
 3. Non-empty `$CODEX_THREAD_ID` -> `codex`
 4. `$(whoami)`
 
+## Enter Commit Delay (CMUX_BRIDGE_COMMIT_DELAY)
+
+`message` / `submit` / `clear` inject an Enter key event after the body to
+commit the submit. If the receiving TUI is still ingesting the pasted text,
+the Enter can be swallowed, so the wrapper sends **delay -> enter -> delay ->
+backup enter**. Each delay (in seconds) is controlled by
+`CMUX_BRIDGE_COMMIT_DELAY`.
+
+| env | Meaning | Default |
+|-----|---------|---------|
+| `CMUX_BRIDGE_COMMIT_DELAY` | `sleep` seconds around the Enter commit (non-negative number) | `0.4` |
+
+Rules:
+
+- Applies to `message` (except `--dry-run`) / `submit` / `clear` only. `send`
+  and `key` have no Enter commit and ignore it.
+- Unset defaults to `0.4`. `0` is allowed (send the two Enters with no wait).
+- Only a non-negative number is accepted (e.g. `0.25`, `1`). Empty value,
+  multiple dots, or non-numeric input exits 2 (no fallback).
+- Validation runs before any cmux call; an invalid value emits no identify /
+  send / send-key.
+
+```bash
+# Shorten the delay to reduce latency when scripting many sends
+export CMUX_BRIDGE_COMMIT_DELAY=0.1
+cmux-bridge message surface:104 "[act:ask id:ping-1] Please respond"
+```
+
 ## spawn — Launch an Agent in a New Pane or Tab
 
 ```bash
