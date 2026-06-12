@@ -24,6 +24,10 @@ CHECKED_SELF_SURFACE=""
 # One subcommand per process, so this global cannot leak across invocations.
 EFFECTIVE_WORKSPACE=""
 
+# Seconds to wait around the Enter commit for message / submit / clear
+# (set by resolve_commit_delay).
+COMMIT_DELAY=""
+
 usage() {
     cat <<'EOF'
 Usage: cmux-bridge <subcommand> [args...]
@@ -60,6 +64,9 @@ Environment variables:
   CLAUDECODE                        If set to "1", auto-detect sender as "claude-code"
   CODEX_THREAD_ID                   If non-empty, auto-detect sender as "codex"
                                     Final fallback is $(whoami)
+  CMUX_BRIDGE_COMMIT_DELAY          Seconds to wait around the Enter commit for
+                                    message / submit / clear (default 0.4;
+                                    non-negative number only; invalid value exits 2)
 
 Exit codes:
   0  Success
@@ -404,6 +411,33 @@ cmux_send_key_event() {
     fi
 }
 
+resolve_commit_delay() {
+    local raw
+    if [[ -n "${CMUX_BRIDGE_COMMIT_DELAY+x}" && -z "${CMUX_BRIDGE_COMMIT_DELAY}" ]]; then
+        echo "cmux-bridge: CMUX_BRIDGE_COMMIT_DELAY is empty (set a non-negative number of seconds)" >&2
+        return 2
+    fi
+    raw="${CMUX_BRIDGE_COMMIT_DELAY:-0.4}"
+    if [[ ! "$raw" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "cmux-bridge: CMUX_BRIDGE_COMMIT_DELAY is invalid (only a non-negative number is allowed)" >&2
+        return 2
+    fi
+    COMMIT_DELAY="$raw"
+}
+
+# Avoid the race where a TUI swallows Enter while it is still ingesting the
+# pasted body: delay -> enter -> delay -> backup enter. An empty submit is
+# ignored by Claude Code / Codex / Cursor, so the extra Enter is harmless.
+# Callers (cmd_message / cmd_submit / cmd_clear) run resolve_commit_delay first.
+commit_with_enter() {
+    local target="$1"
+    local workspace="${2:-}"
+    sleep "$COMMIT_DELAY"
+    cmux_send_key_event "$target" enter "$workspace"
+    sleep "$COMMIT_DELAY"
+    cmux_send_key_event "$target" enter "$workspace"
+}
+
 # Thin wrapper around cmux send. Args: [--force] <surface> <text>.
 # Callers must quote text correctly when it contains shell special characters.
 cmd_send() {
@@ -418,10 +452,11 @@ cmd_send() {
 # event, so text can otherwise remain unsent in the prompt.
 cmd_submit() {
     parse_force_and_two_args submit "$@" || return $?
+    resolve_commit_delay || return $?
     resolve_effective_workspace "$PARSED_ARG1" "$PARSED_WORKSPACE"
     check_target_surface "$PARSED_ARG1" "$PARSED_FORCE" "$EFFECTIVE_WORKSPACE" || return $?
     cmux_send_text "$PARSED_ARG1" "$PARSED_ARG2" "$EFFECTIVE_WORKSPACE"
-    cmux_send_key_event "$PARSED_ARG1" enter "$EFFECTIVE_WORKSPACE"
+    commit_with_enter "$PARSED_ARG1" "$EFFECTIVE_WORKSPACE"
 }
 
 # Get a target surface_type such as "terminal" or "browser".
@@ -825,6 +860,7 @@ cmd_message() {
     # Dry-run also skips reverse-lookup (the resolver): the payload is workspace-
     # independent, so there is no need to call `cmux tree`.
     if (( dry_run == 0 )); then
+        resolve_commit_delay || return $?
         resolve_effective_workspace "$target" "$workspace"
         check_target_surface "$target" "$force" "$EFFECTIVE_WORKSPACE" || return $?
     else
@@ -887,11 +923,12 @@ cmd_message() {
         return 0
     fi
 
-    # Send text, then send an Enter key event. TUIs in termios raw mode can
-    # distinguish LF bytes from Enter key events, so a separate send-key call is
-    # required for reliable submission.
+    # Send text, then commit with a delayed double-enter. TUIs in termios raw
+    # mode distinguish LF bytes from Enter key events, and may swallow Enter
+    # while still ingesting the pasted body, so commit_with_enter adds delay and
+    # a backup Enter.
     cmux_send_text "$target" "$payload" "$EFFECTIVE_WORKSPACE"
-    cmux_send_key_event "$target" enter "$EFFECTIVE_WORKSPACE"
+    commit_with_enter "$target" "$EFFECTIVE_WORKSPACE"
 }
 
 # Thin wrapper around cmux send-key. Args: [--force] <surface> <key>.
@@ -938,15 +975,17 @@ cmd_clear() {
         return 2
     fi
     local target="$1"
+    resolve_commit_delay || return $?
     resolve_effective_workspace "$target" "$PARSED_WORKSPACE"
     check_target_surface "$target" "$force" "$EFFECTIVE_WORKSPACE" || return $?
     # Why: cmux send appends to existing prompt input. Clear the input first so
     # `/clear` starts at the beginning and is parsed as a slash command. ctrl+u
     # clears from line start to cursor in shells and common AI TUIs.
     cmux_send_key_event "$target" ctrl+u "$EFFECTIVE_WORKSPACE"
-    # Same Enter handling as message: send text, then a real Enter key event.
+    # Same Enter handling as message: send text, then commit with delayed
+    # double-enter so the slash command is not swallowed during ingestion.
     cmux_send_text "$target" "/clear" "$EFFECTIVE_WORKSPACE"
-    cmux_send_key_event "$target" enter "$EFFECTIVE_WORKSPACE"
+    commit_with_enter "$target" "$EFFECTIVE_WORKSPACE"
 }
 
 main() {
