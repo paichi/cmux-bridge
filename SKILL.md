@@ -174,6 +174,26 @@ For another workspace, use `cmux-bridge list --workspace workspace:N`.
 When reporting targets to users, prefer pane titles, labels, agent names, and
 roles; use numeric IDs only for precision.
 
+## Spawning Agents
+
+Use `spawn` to launch a new AI agent in a fresh cmux pane or tab and obtain
+its surface ref:
+
+```bash
+cmux-bridge spawn --agent <claude|codex|cursor> [--model <model>] \
+  [--cwd <path>] [--placement pane|tab] [--dry-run]
+```
+
+On success, stdout is one line: the new surface ref (for example
+`surface:91`). Pass that ref to `message` as the target.
+
+The spawned CLI may still be booting. Before the first `message`, wait a few
+seconds or run `read <surface>` once to confirm the prompt is ready; the
+polling rules above still apply. The spawned agent has not read this skill
+yet, so the first message should ask it to read the `cmux-bridge` skill.
+
+Option specs, exit codes, and examples: `references/command-details.md`.
+
 ## Exit Codes
 
 | Exit | Meaning | Action |

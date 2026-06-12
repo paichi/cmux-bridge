@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# cmux-bridge spawn — launch an AI agent in a new cmux pane or tab
+
+set -euo pipefail
+
+SPAWN_AGENT=""
+SPAWN_MODEL=""
+SPAWN_CWD=""
+SPAWN_PLACEMENT="pane"
+SPAWN_DRY_RUN=0
+
+spawn_usage() {
+    cat <<'EOF'
+Usage: cmux-bridge spawn --agent <claude|codex|cursor> [--model <model>] \
+  [--cwd <path>] [--placement pane|tab] [--dry-run]
+EOF
+}
+
+has_self_env_request() {
+    [[ -n "${CMUX_BRIDGE_SELF_WORKSPACE+x}" || -n "${CMUX_BRIDGE_SELF_SURFACE+x}" ]]
+}
+
+spawn_outside_cmux_error() {
+    echo "cmux-bridge: cannot spawn outside a cmux surface. Run from inside a cmux terminal pane" >&2
+    return 8
+}
+
+is_valid_self_env_value() {
+    local value="$1"
+    local ref_prefix="$2"
+    [[ "$value" =~ ^${ref_prefix}:[0-9]+$ ]] && return 0
+    [[ "$value" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] && return 0
+    return 1
+}
+
+validate_spawn_args() {
+    if [[ -z "$SPAWN_AGENT" ]]; then
+        echo "cmux-bridge: 'spawn' requires --agent" >&2
+        spawn_usage >&2
+        return 2
+    fi
+    case "$SPAWN_AGENT" in
+        claude|codex|cursor) ;;
+        *)
+            echo "cmux-bridge: 'spawn' --agent accepts only claude / codex / cursor" >&2
+            return 2
+            ;;
+    esac
+    if [[ -n "$SPAWN_MODEL" ]] && [[ ! "$SPAWN_MODEL" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        echo "cmux-bridge: 'spawn' --model contains invalid characters" >&2
+        return 2
+    fi
+    if [[ -n "$SPAWN_CWD" && ! -d "$SPAWN_CWD" ]]; then
+        echo "cmux-bridge: 'spawn' --cwd directory does not exist" >&2
+        return 2
+    fi
+    case "$SPAWN_PLACEMENT" in
+        pane|tab) ;;
+        *)
+            echo "cmux-bridge: 'spawn' --placement accepts only pane or tab" >&2
+            return 2
+            ;;
+    esac
+    if has_self_env_request; then
+        local self_ws="${CMUX_BRIDGE_SELF_WORKSPACE-}"
+        local self_surf="${CMUX_BRIDGE_SELF_SURFACE-}"
+        if [[ -z "$self_ws" || -z "$self_surf" ]]; then
+            echo "cmux-bridge: set both CMUX_BRIDGE_SELF_WORKSPACE and CMUX_BRIDGE_SELF_SURFACE (setting only one is a configuration error)" >&2
+            return 2
+        fi
+        if ! is_valid_self_env_value "$self_ws" workspace; then
+            echo "cmux-bridge: CMUX_BRIDGE_SELF_WORKSPACE accepts only workspace:N or a UUID (bare index is rejected)" >&2
+            return 2
+        fi
+        if ! is_valid_self_env_value "$self_surf" surface; then
+            echo "cmux-bridge: CMUX_BRIDGE_SELF_SURFACE accepts only surface:N or a UUID (bare index is rejected)" >&2
+            return 2
+        fi
+    fi
+}
+
+parse_spawn_args() {
+    SPAWN_AGENT="" SPAWN_MODEL="" SPAWN_CWD=""
+    SPAWN_PLACEMENT="pane" SPAWN_DRY_RUN=0
+    if (( $# == 0 )); then
+        spawn_usage >&2
+        return 2
+    fi
+    while (( $# > 0 )); do
+        case "$1" in
+            --agent|--model|--cwd|--placement)
+                if (( $# < 2 )); then
+                    echo "cmux-bridge: '$1' requires a value" >&2
+                    return 2
+                fi
+                case "$1" in
+                    --agent) SPAWN_AGENT="$2" ;;
+                    --model) SPAWN_MODEL="$2" ;;
+                    --cwd) SPAWN_CWD="$2" ;;
+                    --placement) SPAWN_PLACEMENT="$2" ;;
+                esac
+                shift 2
+                ;;
+            --dry-run) SPAWN_DRY_RUN=1; shift ;;
+            --*)
+                echo "cmux-bridge: 'spawn' got an unknown flag" >&2
+                return 2
+                ;;
+            *)
+                echo "cmux-bridge: 'spawn' got an unknown argument" >&2
+                return 2
+                ;;
+        esac
+    done
+    validate_spawn_args
+}
+
+resolve_spawn_workspace() {
+    local self_ws="${CMUX_BRIDGE_SELF_WORKSPACE-}"
+    local self_surf="${CMUX_BRIDGE_SELF_SURFACE-}"
+    if [[ -n "$self_ws" && -n "$self_surf" ]]; then
+        printf '%s' "$self_ws"
+        return 0
+    fi
+    if [[ -n "${CMUX_WORKSPACE_ID:-}" ]]; then
+        printf '%s' "$CMUX_WORKSPACE_ID"
+        return 0
+    fi
+    local json ref py_status
+    set +e
+    json="$(cmux identify --json 2>&1)"
+    set -e
+    [[ "$json" == "{"* ]] || spawn_outside_cmux_error
+    set +e
+    ref="$(printf '%s' "$json" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except json.JSONDecodeError:
+    sys.exit(2)
+caller = data.get("caller")
+if not isinstance(caller, dict):
+    sys.exit(3)
+ref = caller.get("workspace_ref")
+if ref is None:
+    sys.exit(4)
+print(ref)
+' 2>/dev/null)"
+    py_status=$?
+    set -e
+    if (( py_status == 4 )); then spawn_outside_cmux_error; fi
+    if (( py_status != 0 )); then
+        echo "cmux-bridge: could not resolve the workspace" >&2
+        return 8
+    fi
+    printf '%s' "$ref"
+}
+
+build_agent_command() {
+    local agent="$1" model="$2" cmd=""
+    case "$agent" in
+        claude) cmd="claude" ;;
+        codex) cmd="codex" ;;
+        cursor) cmd="cursor-agent" ;;
+    esac
+    if [[ -n "$model" ]]; then
+        case "$agent" in
+            codex) cmd="$cmd -m $model" ;;
+            *) cmd="$cmd --model $model" ;;
+        esac
+    fi
+    if [[ -n "$SPAWN_CWD" ]]; then
+        cmd="cd $(printf '%q' "$SPAWN_CWD") && $cmd"
+    fi
+    printf '%s' "$cmd"
+}
+
+extract_surface_ref() {
+    local field
+    field="$(printf '%s' "$1" | awk '{print $2}')"
+    if [[ ! "$field" =~ ^surface:[0-9]+$ ]]; then
+        echo "cmux-bridge: could not extract a surface ref from cmux output" >&2
+        return 3
+    fi
+    printf '%s' "$field"
+}
+
+create_spawn_surface() {
+    local workspace="$1" output create_status
+    set +e
+    if [[ "$SPAWN_PLACEMENT" == "tab" ]]; then
+        output="$(cmux new-surface --type terminal --workspace "$workspace")"
+    else
+        output="$(cmux new-pane --type terminal --direction right --focus false --workspace "$workspace")"
+    fi
+    create_status=$?
+    set -e
+    if (( create_status != 0 )); then
+        echo "cmux-bridge: failed to create the pane or tab" >&2
+        return 1
+    fi
+    extract_surface_ref "$output"
+}
+
+rename_spawn_tab() {
+    local workspace="$1" surface="$2"
+    set +e
+    cmux rename-tab --workspace "$workspace" --surface "$surface" \
+        "${SPAWN_AGENT}:${SPAWN_MODEL:-default}" >/dev/null 2>&1
+    local rename_status=$?
+    set -e
+    if (( rename_status != 0 )); then
+        echo "cmux-bridge: failed to rename the tab title (continuing)" >&2
+    fi
+}
+
+inject_spawn_command() {
+    local workspace="$1" surface="$2" launch_cmd="$3"
+    if ! cmux send --workspace "$workspace" --surface "$surface" -- "$launch_cmd" >/dev/null; then
+        echo "cmux-bridge: failed to send the launch command" >&2
+        return 1
+    fi
+    if ! cmux send-key --workspace "$workspace" --surface "$surface" -- enter >/dev/null; then
+        echo "cmux-bridge: failed to send the Enter key" >&2
+        return 1
+    fi
+}
+
+cmd_spawn() {
+    parse_spawn_args "$@" || return $?
+    local launch_cmd
+    launch_cmd="$(build_agent_command "$SPAWN_AGENT" "$SPAWN_MODEL")"
+    if (( SPAWN_DRY_RUN == 1 )); then
+        printf '%s\n' "$launch_cmd"
+        return 0
+    fi
+    local workspace ws_status surface surf_status
+    set +e
+    workspace="$(resolve_spawn_workspace)"
+    ws_status=$?
+    set -e
+    (( ws_status == 0 )) || return "$ws_status"
+    set +e
+    surface="$(create_spawn_surface "$workspace")"
+    surf_status=$?
+    set -e
+    (( surf_status == 0 )) || return "$surf_status"
+    rename_spawn_tab "$workspace" "$surface"
+    inject_spawn_command "$workspace" "$surface" "$launch_cmd" || return $?
+    printf '%s\n' "$surface"
+}
+
+cmd_spawn "$@"

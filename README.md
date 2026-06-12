@@ -70,6 +70,29 @@ For a more precise target, right-click the cmux tab, choose **Copy ID**, and pas
 Ask Codex at `surface:104` to review this change.
 ```
 
+### Spawning Agents with a Specific Model
+
+Instead of opening every pane yourself, an agent can launch a new agent with
+an explicit model and start talking to it:
+
+```text
+Spawn a Claude Code pane on haiku and have it draft the unit tests.
+```
+
+```text
+Launch cursor-agent with the composer model in a new pane and review this diff together.
+```
+
+Under the hood this uses the `spawn` subcommand, which creates a new pane (or
+tab), launches the chosen CLI with the requested model, and prints the new
+surface ref to message:
+
+```bash
+new="$(cmux-bridge spawn --agent claude --model haiku)"
+sleep 3   # the CLI is still booting; wait briefly (or read once)
+cmux-bridge message "$new" "Please read the cmux-bridge skill. [act:ask id:spawn-1] Ready to pair?"
+```
+
 ## Multi-Agent Orchestration
 
 `cmux-bridge` can be used not only for one-off questions, but also for multi-agent orchestration.
