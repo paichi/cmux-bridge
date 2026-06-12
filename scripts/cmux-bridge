@@ -43,6 +43,9 @@ Subcommands:
                                     Send raw /clear without the bridge message header
   key [--workspace <workspace>] [--force] <surface> <key>
                                     Send a key event, e.g. enter or ctrl+c
+  spawn --agent <claude|codex|cursor> [--model <model>] [--cwd <path>]
+                                    [--placement pane|tab] [--dry-run]
+                                    Launch an AI agent in a new pane/tab and print its surface ref
 
 Flags:
   --force                           Skip surface_type precheck and allow non-terminal targets
@@ -982,6 +985,20 @@ main() {
             ;;
         clear)
             cmd_clear "$@"
+            ;;
+        spawn)
+            script_path="$0"
+            while [[ -L "$script_path" ]]; do
+                link_dir="$(cd "$(dirname "$script_path")" && pwd)"
+                link_target="$(readlink "$script_path")"
+                if [[ "$link_target" != /* ]]; then
+                    script_path="$link_dir/$link_target"
+                else
+                    script_path="$link_target"
+                fi
+            done
+            script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+            exec "$script_dir/cmux-bridge-spawn" "$@"
             ;;
         *)
             echo "cmux-bridge: unknown subcommand '$subcommand'" >&2

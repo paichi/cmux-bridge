@@ -55,3 +55,70 @@ Sender detection order:
 2. `$CLAUDECODE == "1"` -> `claude-code`
 3. Non-empty `$CODEX_THREAD_ID` -> `codex`
 4. `$(whoami)`
+
+## spawn — Launch an Agent in a New Pane or Tab
+
+```bash
+cmux-bridge spawn --agent <claude|codex|cursor> [--model <model>] [--cwd <path>] [--placement pane|tab] [--dry-run]
+```
+
+On success, stdout is a single line: the new surface ref (for example
+`surface:91`). Use it as the `message` target. Warnings (such as rename-tab
+failure) go to stderr and are non-fatal.
+
+### Agent to Launch Command Mapping
+
+| `--agent` | binary | model flag when `--model` is set |
+|-----------|--------|----------------------------------|
+| `claude` | `claude` | `--model <model>` |
+| `codex` | `codex` | `-m <model>` |
+| `cursor` | `cursor-agent` | `--model <model>` |
+
+If `--model` is omitted, no model flag is appended. Model names are not
+whitelisted; only character validation applies (`^[A-Za-z0-9._-]+$`, exit 2
+on mismatch).
+
+### Options
+
+| Option | Behavior |
+|--------|----------|
+| `--agent` | Required. `claude`, `codex`, or `cursor` only (exit 2 otherwise). |
+| `--model` | Optional. Omitted = no model flag on the launch command. |
+| `--cwd` | Optional. Directory must exist (exit 2 if not). Injects `cd <path> && ...` with `printf '%q'` quoting. |
+| `--placement` | Optional. `pane` (default, split right) or `tab` (`new-surface`). Other values exit 2. |
+| `--dry-run` | After argument validation, prints the launch command on stdout and exits 0 without calling cmux. |
+
+### Workspace Resolution (non-dry-run)
+
+1. `CMUX_BRIDGE_SELF_WORKSPACE` and `CMUX_BRIDGE_SELF_SURFACE` both non-empty:
+   use the workspace side (partial pair exits 2, same rule as elsewhere).
+2. Else non-empty `CMUX_WORKSPACE_ID`.
+3. Else `cmux identify --json` `caller.workspace_ref`.
+4. All fail: exit 8 (running outside cmux context).
+
+Self env values follow the ref/UUID-only rule: bare index is rejected with
+exit 2; there is no fallback to plain identify.
+
+### Exit Codes (spawn)
+
+| Exit | Meaning |
+|------|---------|
+| 0 | Success (stdout = new surface ref) |
+| 1 | cmux runtime error (pane creation, send, etc.) |
+| 2 | Argument error / partial self env pair / invalid self env value |
+| 3 | cmux output schema violation (cannot parse the surface ref) |
+| 8 | cmux context unavailable (workspace cannot be resolved) |
+
+### Example
+
+```bash
+new="$(cmux-bridge spawn --agent claude --model haiku)"
+# -> surface:91
+sleep 3   # or: cmux-bridge read "$new" 20   (once, not polled)
+cmux-bridge message "$new" "Please read the cmux-bridge skill. [act:ask id:spawn-1] Ready to pair?"
+```
+
+### Failure Note
+
+If command injection fails after the pane or tab was created, the empty
+surface may remain open. Close it manually in cmux if needed.
