@@ -152,6 +152,8 @@ If an agent replies with `think`, it is still working. Do not keep sending more 
 
 If an agent replies with `close`, the topic is finished. Do not reply with "ok" or "thanks" to `close`.
 
+If a long message is split into parts, each part is tagged `(n/m)` (for example `(1/3)`, `(2/3)`, `(3/3)`). The receiving agent holds its reply until the last part `(m/m)` arrives, then replies once. This prevents replying before the full message is in.
+
 ## Troubleshooting
 
 If messages do not arrive, check that the target agent is running in a cmux terminal pane.
