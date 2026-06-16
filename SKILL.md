@@ -92,7 +92,9 @@ Rules:
 - Body must not contain newlines, tabs, control characters, or literal `\n`,
   `\r`, `\t` sequences.
 - Quote the body with `"..."`; escape inner `"` as `\"`.
-- Split multi-line content into separate `message` calls.
+- Split multi-line content into separate `message` calls. When you do, tag each
+  part with `(n/m)` (only when m≥2; same `id`, in order n=1→m); the receiver
+  waits until `(m/m)` arrives. See `references/protocol-details.md`.
 - Do not use `--force` for bridge conversations.
 - `--workspace` is usually unnecessary: a `surface:N` in another workspace is
   resolved automatically. Pass it only to override; an explicit value wins.
@@ -132,6 +134,8 @@ Core rules:
 5. If the target pane disappeared, is not terminal, or is yourself, stop and
    follow the wrapper exit code.
 6. Do not repeatedly poll the other pane.
+7. When a part tagged `(n/m)` (m≥2) arrives, hold your reply until `(m/m)`, then
+   concatenate the parts and reply once.
 
 For the first message to a new peer, ask it to read the `cmux-bridge` skill.
 Skip this only when the peer recently used the protocol or you are replying to a

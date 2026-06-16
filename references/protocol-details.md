@@ -125,6 +125,47 @@ When reporting before or after a send, describe in this order:
 2. Relationship, such as same `cmux list` output or another workspace
 3. Optional `surface:N` in parentheses
 
+## Message Splitting (n/m Part Markers)
+
+Core rule: when one logical message is split across several `message` calls, tag
+each part with `(n/m)` right after the act/id header (`n` = current part, `m` =
+total parts). Tag only when m≥2, share one `id`, and send in order n=1→m. The
+receiver holds its reply until `(m/m)` arrives.
+
+### Why `id` alone is not enough
+
+`id` groups one topic; it cannot express how many parts a single logical message
+has or which one this is. Without a marker the receiver may reply at part 1 of 3,
+an early-reply race. `(n/m)` adds an ordering/completeness axis orthogonal to `id`.
+
+### Format and example
+
+Each part repeats `[act id]` and places `(n/m)` right after it (act/id stays the
+leading token by convention).
+
+```text
+[cmux-bridge from:claude-code reply-to:surface:105] [act:inform id:plan-1] (1/3) First, settle the approach.
+[cmux-bridge from:claude-code reply-to:surface:105] [act:inform id:plan-1] (2/3) Next, write the tests.
+[cmux-bridge from:claude-code reply-to:surface:105] [act:inform id:plan-1] (3/3) Finally, run review.
+```
+
+### Receiver state machine
+
+```text
+Idle ──(single message: no marker / (1/1))──▶ reply, back to Idle
+Idle ──((n/m) received, m≥2)──▶ Collecting (buffer the part)
+Collecting ──(next part n<m)──▶ Collecting (append)
+Collecting ──((m/m) received)──▶ Complete ──(concatenate, reply once)──▶ Idle
+Collecting ──(silence)──▶ degrade to the retry / exit-code path (Idle)
+```
+
+### Missing part (no clarify)
+
+If `(m/m)` never arrives, do not invent a dedicated notice (clarify). Degrade to
+the existing silence and retry rules (state check before sending, retry 1-2 times
+with the same `id`). Judge on what you have, or split out the peer's state via the
+exit codes. The exit from waiting is a timeout, not a new message type.
+
 ## Example: Receive, Extract, Reply
 
 Situation: this line appears in the terminal:
