@@ -806,10 +806,89 @@ is_valid_sender() {
     [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]
 }
 
+# Resolve an ancestor whose argv[0] basename is 'agent' (the short symlink) or
+# 'cursor-agent' (e.g. ~/.local/bin/cursor-agent) to the basename of its real
+# target. Cursor can launch under either name, so both are followed through the
+# symlink/real path and confirmed to resolve to 'cursor-agent'.
+#
+# Why make the path absolute first via `command -v`:
+#   When `ps -o comm=` returns the bare name 'agent' (a PATH launch), resolving
+#   it while relative could match an unrelated 'agent' under the wrapper's CWD.
+#   Making the path absolute first removes that CWD dependency.
+_resolve_agent_symlink_basename() {
+    local path="$1"
+    case "$path" in
+        /*) : ;;
+        *)  path="$(command -v -- "$path" 2>/dev/null)" || return 1 ;;
+    esac
+    [[ -n "$path" ]] || return 1
+    local hop
+    for (( hop = 0; hop < 8; hop++ )); do
+        [[ -L "$path" ]] || break
+        local dir target
+        dir="$(cd "$(dirname -- "$path")" && pwd)" || return 1
+        target="$(readlink -- "$path")" || return 1
+        case "$target" in
+            /*) path="$target" ;;
+            *)  path="$dir/$target" ;;
+        esac
+    done
+    basename -- "$path"
+}
+
+# Detect the agent kind from the process ancestry and set the fixed sender
+# literal in the global DETECTED_AGENT.
+#
+# Why a global instead of a return value:
+#   If the caller captured this via sender="$(...)", Bash would silently strip a
+#   trailing newline and could let a crafted value slip past is_valid_sender.
+#   So this helper writes only fixed literals as a side effect and the caller
+#   reads the global without command substitution. DETECTED_AGENT is only ever
+#   assigned a compile-time fixed literal (claude-code/codex/devin/cursor); the
+#   is_valid_sender gate stays the final backstop if that invariant is broken.
+#
+# Termination: pid<=1, a failed ps call, or reaching a real login/cmux/init
+# process. Non-login intermediate shells (zsh/bash) are walked through on
+# purpose, since an agent sits above its own tool-call shell. The nearest
+# matching ancestor wins. If ps is unavailable the function returns 1 and the
+# caller falls back to whoami.
+detect_agent_by_ancestry() {
+    DETECTED_AGENT=""
+    local hop pid comm base resolved
+    pid="$(ps -o ppid= -p "$$" 2>/dev/null | tr -cd '0-9')"
+    # Hop cap 12 is a safety valve against a broken chain (the deepest real
+    # chain pane-shell -> agent -> login-shell -> login -> cmux is about 5).
+    for (( hop = 0; hop < 12; hop++ )); do
+        # pid is already normalized to digits by `tr -cd '0-9'`, so only the
+        # empty case (ps returned a blank line) needs guarding.
+        [[ -z "$pid" ]] && return 1
+        (( pid <= 1 )) && return 1
+        comm="$(ps -o comm= -p "$pid" 2>/dev/null)" || return 1
+        [[ -z "$comm" ]] && return 1
+        # comm is the executable name/path without arguments. Strip a leading
+        # '-' (login-shell marker) before taking the basename.
+        base="$(basename -- "${comm#-}")"
+        case "$base" in
+            claude) DETECTED_AGENT='claude-code'; return 0 ;;
+            codex)  DETECTED_AGENT='codex';       return 0 ;;
+            devin)  DETECTED_AGENT='devin';       return 0 ;;
+            agent|cursor-agent)
+                resolved="$(_resolve_agent_symlink_basename "$comm")"
+                if [[ "$resolved" == 'cursor-agent' ]]; then
+                    DETECTED_AGENT='cursor'; return 0
+                fi
+                ;;
+            login|cmux|init) return 1 ;;
+        esac
+        pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -cd '0-9')"
+    done
+    return 1
+}
+
 # Send a bridge message with sender metadata.
 # Output format: [cmux-bridge from:<sender> reply-to:<my-surface>] <body>\n
 # Sender resolution order: CMUX_AGENT_NAME, CLAUDECODE=="1",
-# non-empty CODEX_THREAD_ID, then whoami.
+# non-empty CODEX_THREAD_ID, process ancestry, then whoami.
 # Body and sender must not contain newlines, tabs, control chars, or cmux
 # escape sequences.
 # --dry-run prints the payload without sending.
@@ -884,6 +963,13 @@ cmd_message() {
         sender='claude-code'
     elif [[ -n "${CODEX_THREAD_ID:-}" ]]; then
         sender='codex'
+    # With no env fast-path, walk the process ancestry. Skip it when CLAUDECODE
+    # is set to any non-empty value (including the "0" opt-out) so an explicit
+    # env signal is never overridden by a process-tree guess. The helper sets a
+    # fixed literal in DETECTED_AGENT, so it is read without command
+    # substitution. A miss falls back silently to whoami.
+    elif [[ -z "${CLAUDECODE:-}" ]] && detect_agent_by_ancestry; then
+        sender="$DETECTED_AGENT"
     else
         sender="$(whoami)"
     fi
