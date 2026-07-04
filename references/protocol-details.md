@@ -189,3 +189,62 @@ cmux-bridge message "$target" "[act:inform id:fib-1] lambda n: n if n < 2 else f
 
 On exit 0, wait for the next response.
 If the user asks you to read recent output, use `cmux-bridge read "$self" 50` and search for the bridge pattern again.
+
+## The `to:` Field and Reply Recovery
+
+### Why the sender stamps `to:`
+
+An agent whose subprocess has no cmux surface/workspace env (for example a tool
+subprocess) makes `cmux identify` return `caller=null`, so the wrapper exits 8,
+cannot build a `reply-to`, and is unable to reply.
+
+To make recovery possible, the sender stamps `to:<recipient surface>` in the
+header whenever the resolved target is a `surface:N`; bare index, UUID, and other
+target forms omit it so the receive regex stays parseable. The receiver can then
+read that `surface:N` back out, set `CMUX_BRIDGE_REPLY_TO` to it, and reply
+without calling identify at all.
+
+### State machine: self (reply-to) resolution order when sending
+
+```mermaid
+stateDiagram-v2
+    [*] --> CheckReplyTo: message send
+    CheckReplyTo --> UseOverride: CMUX_BRIDGE_REPLY_TO is surface:N
+    CheckReplyTo --> Exit2: set but malformed
+    CheckReplyTo --> CheckSelfEnv: unset
+    CheckSelfEnv --> IdentifySelfEnv: SELF_WORKSPACE + SELF_SURFACE both set
+    CheckSelfEnv --> Exit2: only one set
+    CheckSelfEnv --> PlainIdentify: unset
+    IdentifySelfEnv --> SelfResolved: success
+    IdentifySelfEnv --> Exit8: caller null
+    PlainIdentify --> SelfResolved: caller present
+    PlainIdentify --> Exit8: caller null
+    UseOverride --> SelfResolved: identify skipped
+    SelfResolved --> Exit9: target == self
+    SelfResolved --> BuildSend: target != self
+    BuildSend --> Done: sent (exit 0)
+    BuildSend --> Exit1: send failed
+```
+
+`CMUX_BRIDGE_REPLY_TO` has the highest priority. The `CMUX_BRIDGE_SELF_*` env
+pair and the plain `identify` path are used only when it is unset.
+
+### State machine: receiver exit-8 recovery loop
+
+```mermaid
+stateDiagram-v2
+    [*] --> Received: message with to:surface:N arrives
+    Received --> TryReply: reply with cmux-bridge message
+    TryReply --> Replied: exit 0 (self-identified)
+    TryReply --> Recover: exit 8 (self-identify failed)
+    TryReply --> Report: other exit (1/6/9) per the exit code table
+    Recover --> Replied: set received to: as CMUX_BRIDGE_REPLY_TO, retry, exit 0
+    Recover --> Report: no to: (cannot recover) or retry still fails
+```
+
+### Constraints
+
+- `CMUX_BRIDGE_REPLY_TO` accepts only `surface:N`; a malformed value exits 2 with no fallback.
+- When `identify` succeeds normally, `CMUX_BRIDGE_REPLY_TO` is not used (unset falls back to the usual path).
+- `to:` is reply-only: a fresh outbound send that cannot self-identify still exits 8 (out of scope here).
+- `to:` is an aid for the receiver to recover its own reply-to, not an authentication boundary.
