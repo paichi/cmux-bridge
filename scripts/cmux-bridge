@@ -154,6 +154,23 @@ resolve_self_json_via_env() {
 #   (4) caller or caller.surface_ref is null, meaning execution is outside cmux
 # Python catches exceptions so users do not see tracebacks.
 current_surface() {
+    # Highest-priority self override. When a receiver cannot self-identify
+    # (its subprocess has no cmux surface env, so `cmux identify` returns
+    # caller=null and the wrapper would otherwise fail as outside cmux), it can
+    # set CMUX_BRIDGE_REPLY_TO to the surface:N it read from the received
+    # message's `to:` field and reply without calling identify at all. Only
+    # surface:N is accepted; any other value is a configuration error with no
+    # fallback.
+    local reply_to_override="${CMUX_BRIDGE_REPLY_TO-}"
+    if [[ -n "$reply_to_override" ]]; then
+        if [[ "$reply_to_override" =~ ^surface:[0-9]+$ ]]; then
+            printf '%s\n' "$reply_to_override"
+            return 0
+        fi
+        echo "cmux-bridge: CMUX_BRIDGE_REPLY_TO must be surface:N" >&2
+        return 2
+    fi
+
     local self_ws="${CMUX_BRIDGE_SELF_WORKSPACE-}"
     local self_surf="${CMUX_BRIDGE_SELF_SURFACE-}"
 
@@ -1002,7 +1019,18 @@ cmd_message() {
         return 5
     fi
 
-    local payload="[cmux-bridge from:${sender} reply-to:${my_surface}] ${body}"
+    # Stamp to:surface:N only when the resolved target tail is surface:N. The
+    # target may also be a bare index, UUID, or hierarchical ref, and stamping a
+    # non-surface:N value would break the receive regex to:(surface:[0-9]+) and
+    # make the whole header unparseable, so those cases omit to: and keep the
+    # legacy, parseable payload.
+    local target_tail="${target##*/}"
+    local payload
+    if [[ "$target_tail" =~ ^surface:[0-9]+$ ]]; then
+        payload="[cmux-bridge from:${sender} reply-to:${my_surface} to:${target_tail}] ${body}"
+    else
+        payload="[cmux-bridge from:${sender} reply-to:${my_surface}] ${body}"
+    fi
 
     if (( dry_run == 1 )); then
         printf '%s\n' "$payload"

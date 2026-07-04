@@ -13,15 +13,23 @@ During local development, the repository root is also the skill directory, so re
 ## Extracting a Received Message in Bash
 
 ```bash
-line='[cmux-bridge from:codex reply-to:surface:104] The memoized Fibonacci version is this'
-if [[ "$line" =~ ^\[cmux-bridge\ from:([^\ ]+)\ reply-to:(surface:[0-9]+)\]\ (.+)$ ]]; then
+line='[cmux-bridge from:codex reply-to:surface:104 to:surface:42] The memoized Fibonacci version is this'
+if [[ "$line" =~ ^\[cmux-bridge\ from:([^\ ]+)\ reply-to:(surface:[0-9]+)(\ to:(surface:[0-9]+))?\]\ (.+)$ ]]; then
     from="${BASH_REMATCH[1]}"       # codex
     reply_to="${BASH_REMATCH[2]}"   # surface:104
-    body="${BASH_REMATCH[3]}"       # The memoized Fibonacci version is this
+    to="${BASH_REMATCH[4]}"         # surface:42 (empty when to: is absent)
+    body="${BASH_REMATCH[5]}"       # The memoized Fibonacci version is this
 fi
 ```
 
 When replying, use `reply-to` as the target exactly as received.
+
+`to:` (`$4`) is the recipient surface the sender addressed, present only when it
+was a `surface:N`. If your own surface cannot be resolved by `cmux identify`
+(caller=null, exits 8) and the received `to:` is yours, set
+`CMUX_BRIDGE_REPLY_TO=surface:N` before sending: the wrapper then adopts that
+value as your reply-to without calling identify. Reply-only; a fresh outbound
+send cannot be recovered this way.
 
 ## Sending Across Workspaces
 
