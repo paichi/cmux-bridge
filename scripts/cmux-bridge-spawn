@@ -7,12 +7,18 @@ SPAWN_AGENT=""
 SPAWN_MODEL=""
 SPAWN_CWD=""
 SPAWN_PLACEMENT="pane"
+SPAWN_SPLIT_FROM=""
+SPAWN_DIRECTION="right"
 SPAWN_DRY_RUN=0
 
 spawn_usage() {
     cat <<'EOF'
 Usage: cmux-bridge spawn --agent <claude|codex|cursor> [--model <model>] \
-  [--cwd <path>] [--placement pane|tab] [--dry-run]
+  [--cwd <path>] [--placement pane|tab] \
+  [--split-from <surface>] [--direction left|right|up|down] [--dry-run]
+
+  --split-from  surface to split (default: this surface); placement=pane only
+  --direction   split direction (default: right); placement=pane only
 EOF
 }
 
@@ -61,6 +67,19 @@ validate_spawn_args() {
             return 2
             ;;
     esac
+    # Split target is passed to cmux as an argument, so use the same minimal
+    # whitelist the wrapper applies to other refs.
+    if [[ -n "$SPAWN_SPLIT_FROM" ]] && [[ ! "$SPAWN_SPLIT_FROM" =~ ^[A-Za-z0-9:/_-]+$ ]]; then
+        echo "cmux-bridge: 'spawn' --split-from contains invalid characters" >&2
+        return 2
+    fi
+    case "$SPAWN_DIRECTION" in
+        left|right|up|down) ;;
+        *)
+            echo "cmux-bridge: 'spawn' --direction accepts only left, right, up, or down" >&2
+            return 2
+            ;;
+    esac
     if has_self_env_request; then
         local self_ws="${CMUX_BRIDGE_SELF_WORKSPACE-}"
         local self_surf="${CMUX_BRIDGE_SELF_SURFACE-}"
@@ -81,14 +100,14 @@ validate_spawn_args() {
 
 parse_spawn_args() {
     SPAWN_AGENT="" SPAWN_MODEL="" SPAWN_CWD=""
-    SPAWN_PLACEMENT="pane" SPAWN_DRY_RUN=0
+    SPAWN_PLACEMENT="pane" SPAWN_SPLIT_FROM="" SPAWN_DIRECTION="right" SPAWN_DRY_RUN=0
     if (( $# == 0 )); then
         spawn_usage >&2
         return 2
     fi
     while (( $# > 0 )); do
         case "$1" in
-            --agent|--model|--cwd|--placement)
+            --agent|--model|--cwd|--placement|--split-from|--direction)
                 if (( $# < 2 )); then
                     echo "cmux-bridge: '$1' requires a value" >&2
                     return 2
@@ -98,6 +117,8 @@ parse_spawn_args() {
                     --model) SPAWN_MODEL="$2" ;;
                     --cwd) SPAWN_CWD="$2" ;;
                     --placement) SPAWN_PLACEMENT="$2" ;;
+                    --split-from) SPAWN_SPLIT_FROM="$2" ;;
+                    --direction) SPAWN_DIRECTION="$2" ;;
                 esac
                 shift 2
                 ;;
@@ -190,8 +211,14 @@ create_spawn_surface() {
     set +e
     if [[ "$SPAWN_PLACEMENT" == "tab" ]]; then
         output="$(cmux new-surface --type terminal --workspace "$workspace")"
+    elif [[ -n "$SPAWN_SPLIT_FROM" ]]; then
+        # Why new-split here: only it takes an explicit surface to split from, so
+        # callers can place several peers instead of stacking narrow columns.
+        # new-pane stays the untargeted path because it needs no caller surface
+        # and keeps working when the wrapper only knows a workspace.
+        output="$(cmux new-split "$SPAWN_DIRECTION" --surface "$SPAWN_SPLIT_FROM" --workspace "$workspace" --focus false)"
     else
-        output="$(cmux new-pane --type terminal --direction right --focus false --workspace "$workspace")"
+        output="$(cmux new-pane --type terminal --direction "$SPAWN_DIRECTION" --focus false --workspace "$workspace")"
     fi
     create_status=$?
     set -e

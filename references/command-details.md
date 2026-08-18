@@ -95,7 +95,8 @@ cmux-bridge message surface:104 "[act:ask id:ping-1] Please respond"
 ## spawn — Launch an Agent in a New Pane or Tab
 
 ```bash
-cmux-bridge spawn --agent <claude|codex|cursor> [--model <model>] [--cwd <path>] [--placement pane|tab] [--dry-run]
+cmux-bridge spawn --agent <claude|codex|cursor> [--model <model>] [--cwd <path>] \
+  [--placement pane|tab] [--split-from <surface>] [--direction left|right|up|down] [--dry-run]
 ```
 
 On success, stdout is a single line: the new surface ref (for example
@@ -122,6 +123,8 @@ on mismatch).
 | `--model` | Optional. Omitted = no model flag on the launch command. |
 | `--cwd` | Optional. Directory must exist (exit 2 if not). Injects `cd <path> && ...` with `printf '%q'` quoting. |
 | `--placement` | Optional. `pane` (default, split right) or `tab` (`new-surface`). Other values exit 2. |
+| `--split-from` | Optional. Surface to split. Given, the pane is created with `new-split <direction> --surface <ref>` instead of `new-pane`; omitted, the previous `new-pane` path is used. Same character whitelist as targets (exit 2 otherwise). Ignored by `--placement tab`. |
+| `--direction` | Optional. `left`, `right` (default), `up`, or `down`. Other values exit 2. Ignored by `--placement tab`. |
 | `--dry-run` | After argument validation, prints the launch command on stdout and exits 0 without calling cmux. |
 
 ### Workspace Resolution (non-dry-run)
