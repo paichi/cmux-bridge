@@ -198,11 +198,19 @@ its surface ref:
 
 ```bash
 cmux-bridge spawn --agent <claude|codex|cursor> [--model <model>] \
-  [--cwd <path>] [--placement pane|tab] [--dry-run]
+  [--cwd <path>] [--placement pane|tab] \
+  [--split-from <surface>] [--direction left|right|up|down] [--dry-run]
 ```
 
 On success, stdout is one line: the new surface ref (for example
 `surface:91`). Pass that ref to `message` as the target.
+
+`--split-from` picks which surface to split and `--direction` which way, so
+several peers can be arranged instead of stacking narrow columns. Both apply to
+`--placement pane` only; omitting them keeps the previous behavior (this pane,
+right). When spawning several peers, create the columns first and split each
+column afterwards, since splitting an already divided pane only affects that
+part.
 
 The spawned CLI may still be booting. Before the first `message`, wait a few
 seconds or run `read <surface>` once to confirm the prompt is ready; the
